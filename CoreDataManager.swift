@@ -1,233 +1,285 @@
 //
 //  CoreDataManager.swift
-//  CoreDataManager Example
+//  
 //
-//  Created by Manuel de la Mata on 13/06/2014.
-//  Copyright (c) 2014 MMS. All rights reserved.
+//  Created by Rohit Pathak on 19/05/19.
+//  Copyright © 2019 Rohit Pathak. All rights reserved.
 //
 
 import Foundation
 import CoreData
 
 
-class CoreDataManager: NSObject {
-    
-    let kStoreName = "TNTCache.sqlite"
-    let kModmName = "CoreDataManager_Example"
+// MARK: - CoreDataManager
 
+/**
+ Responsible for setting up the Core Data stack. Also provides some convenience methods for fetching, deleting, and saving.
+ */
+class CoreDataManager:NSObject {
     
-    var _managedObjectContext: NSManagedObjectContext? = nil
+    static fileprivate let mustCallSetupMethodErrorMessage = "CoreDataManager must be set up using setUp(withDataModelName:bundle:persistentStoreType:) before it can be used."
+    
+    var _privateContext: NSManagedObjectContext? = nil
+    var _writerContext: NSManagedObjectContext? = nil
+    var _mainContext: NSManagedObjectContext? = nil
+
     var _managedObjectModel: NSManagedObjectModel? = nil
     var _persistentStoreCoordinator: NSPersistentStoreCoordinator? = nil
     
     
-    
-    class var shared:CoreDataManager{
-        get {
-            struct Static {
-                static var instance : CoreDataManager? = nil
-                static var token : dispatch_once_t = 0
-            }
-            dispatch_once(&Static.token) { Static.instance = CoreDataManager() }
-            
-            return Static.instance!
-        }
-    }
-    
+    override init(){
+        super.init()
 
-    func initialize(){
-        self.managedObjectContext
+        NotificationCenter.default.addObserver(self, selector: #selector(contextDidSavePrivateQueueContext), name: .NSManagedObjectContextDidSave, object: privateContext)
+        
+        NotificationCenter.default.addObserver(self, selector: #selector(contextDidSaveMainQueueContext), name: .NSManagedObjectContextDidSave, object: privateContext)
     }
     
-    // #pragma mark - Core Data stack
+    // MARK: Properties
     
-    var managedObjectContext: NSManagedObjectContext{
+    static let dataModelName = "Missing.xcdatamodel"
     
-        if NSThread.isMainThread() {
-            
-            if !_managedObjectContext {
-                let coordinator = self.persistentStoreCoordinator
-                if coordinator != nil {
-                    _managedObjectContext = NSManagedObjectContext(concurrencyType: .MainQueueConcurrencyType)
-                    _managedObjectContext!.persistentStoreCoordinator = coordinator
+    /// The logger to use for logging errors caught internally. A default logger is used if a custom one isn't provided. Assigning nil to this property prevents CoreDataManager from emitting any logs to the console.
+    //public static var errorLogger: CoreDataManagerErrorLogger? = DefaultLogger()
+    
+    /// The value to use for `fetchBatchSize` when fetching objects.
+    public var defaultFetchBatchSize = 50
+    
+    
+    // MARK: Core Data Stack
+    @objc func contextDidSavePrivateQueueContext(notification:Notification){
+    
+        DispatchQueue.main.async {
+            let mainContext  = self.mainContext
+            mainContext.performAndWait {
+                mainContext.mergeChanges(fromContextDidSave: notification)
+                do{
+                    try mainContext.save()
+                }catch let error {
+                    // log error
+                    self.log(error: error)
                 }
-                
-                return _managedObjectContext!
             }
-            
-        }else{
-            
-            var threadContext : NSManagedObjectContext? = NSThread.currentThread().threadDictionary["NSManagedObjectContext"] as? NSManagedObjectContext;
-            
-            println(NSThread.currentThread().threadDictionary)
-            
-            if threadContext == nil {
-                                println("creating new context")
-                threadContext = NSManagedObjectContext(concurrencyType: .PrivateQueueConcurrencyType)
-                threadContext!.parentContext = _managedObjectContext
-                threadContext!.name = NSThread.currentThread().description
-                
-                NSThread.currentThread().threadDictionary["NSManagedObjectContext"] = threadContext
-                
-                NSNotificationCenter.defaultCenter().addObserver(self, selector:"contextWillSave:" , name: NSManagedObjectContextWillSaveNotification, object: threadContext)
-                
-            }else{
-                println("using old context")
-            }
-            return threadContext!;
         }
-            
-        return _managedObjectContext!
     }
     
-    
-    
-    // Returns the managed object model for the application.
-    // If the model doesn't already exist, it is created from the application's model.
-    var managedObjectModel: NSManagedObjectModel {
-    if !_managedObjectModel {
-        let modelURL = NSBundle.mainBundle().URLForResource(kModmName, withExtension: "momd")
-        _managedObjectModel = NSManagedObjectModel(contentsOfURL: modelURL)
+    @objc func contextDidSaveMainQueueContext(notification:Notification){
+        
+        let writerContext = self.writerContext
+        
+        writerContext.perform {
+            writerContext.mergeChanges(fromContextDidSave: notification)
+            
+            do{
+                try writerContext.save()
+            }catch let error {
+                // log error
+                self.log(error: error)
+            }
         }
-        return _managedObjectModel!
     }
-  
     
-    // Returns the persistent store coordinator for the application.
-    // If the coordinator doesn't already exist, it is created and the application's store added to it.
-    var persistentStoreCoordinator: NSPersistentStoreCoordinator {
-    if !_persistentStoreCoordinator {
-        let storeURL = self.applicationDocumentsDirectory.URLByAppendingPathComponent(kStoreName)
-        var error: NSError? = nil
-        _persistentStoreCoordinator = NSPersistentStoreCoordinator(managedObjectModel: self.managedObjectModel)
-        if _persistentStoreCoordinator!.addPersistentStoreWithType(NSSQLiteStoreType, configuration: nil, URL: storeURL, options: self.databaseOptions(), error: &error) == nil {
+    var applicationDocumentsDirectory: URL = {
+        
+        let urls = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+        return urls[urls.count - 1]
+    }()
+    
+    var managedObjectModel: NSManagedObjectModel = {
+        
+        guard let modelURL = Bundle.main.url(forResource: dataModelName, withExtension: "momd") else {
+            fatalError("Failed to locate data model schema file.")
+        }
+        
+        guard let managedObjectModel = NSManagedObjectModel(contentsOf: modelURL) else {
+            fatalError("Failed to created managed object model")
+        }
+        
+        return managedObjectModel
+    }()
+    
+    var persistentStoreCoordinator: NSPersistentStoreCoordinator{
+        
+        _persistentStoreCoordinator = NSPersistentStoreCoordinator(managedObjectModel:self.managedObjectModel)
 
-            abort()
+        let url = self.applicationDocumentsDirectory.appendingPathComponent("\(CoreDataManager.dataModelName).sqlite")
+
+        let options = [
+            NSMigratePersistentStoresAutomaticallyOption: true,
+            NSInferMappingModelAutomaticallyOption: true
+        ]
+
+        do {
+            try _persistentStoreCoordinator!.addPersistentStore(ofType:NSSQLiteStoreType, configurationName: nil, at: url, options: options)
         }
+        catch let error as NSError {
+            fatalError("Failed to initialize the application's persistent data: \(error.localizedDescription)")
         }
+        catch {
+            fatalError("Failed to initialize the application's persistent data")
+        }
+        
         return _persistentStoreCoordinator!
     }
     
-
-    
-    // #pragma mark - fetches
-    
-    func executeFetchRequest(request:NSFetchRequest)-> Array<AnyObject>?{
-
-        var results:Array<AnyObject>?
-        self.managedObjectContext.performBlockAndWait{
-            var fetchError:NSError?
-            results = self.managedObjectContext.executeFetchRequest(request, error: &fetchError)
-            
-            if let error = fetchError {
-                println("Warning!! \(error.description)")
-            }
+    fileprivate var writerContext: NSManagedObjectContext {
+        
+        if _writerContext == nil {
+            _writerContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            _writerContext!.persistentStoreCoordinator = self.persistentStoreCoordinator
         }
-        return results
-        
+       
+        return _writerContext!
     }
-
     
-    func executeFetchRequest(request:NSFetchRequest, completionHandler:(results: Array<AnyObject>?) -> Void)-> (){
+    public var privateContext: NSManagedObjectContext{
         
-        self.managedObjectContext.performBlock{
-            var fetchError:NSError?
-            var results:Array<AnyObject>?
-             results = self.managedObjectContext.executeFetchRequest(request, error: &fetchError)
-            
-            if let error = fetchError {
-                println("Warning!! \(error.description)")
-            }
-    
-            completionHandler(results: results)
+        if(_privateContext == nil){
+            _privateContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            _privateContext!.parent = self.mainContext
         }
         
+        return _privateContext!
     }
-
-
     
-    // #pragma mark - save methods
-    
-    func save() {
+    /// A MainQueueConcurrencyType context whose parent is a PrivateQueueConcurrencyType Writer Context. The PrivateQueueConcurrencyType Writer context is the root context.
+    public var mainContext: NSManagedObjectContext {
         
-        var context:NSManagedObjectContext = self.managedObjectContext;
-        if context.hasChanges {
+        if(_mainContext == nil){
+            _mainContext = NSManagedObjectContext(concurrencyType: .mainQueueConcurrencyType)
+            _mainContext!.parent = self.writerContext
+        }
+        
+        return _mainContext!
+    }
+    
+    
+    // MARK: Fetching
+    
+    /**
+     This is a convenience method for performing a fetch request. Note: Errors thrown by executeFetchRequest are suppressed and logged in order to make usage less verbose. If detecting thrown errors is needed in your use case, you will need to use Core Data directly.
+     
+     - parameter entity:          The NSManagedObject subclass to be fetched.
+     - parameter predicate:       A predicate to use for the fetch if needed (defaults to nil).
+     - parameter sortDescriptors: Sort descriptors to use for the fetch if needed (defaults to nil).
+     - parameter context:         The NSManagedObjectContext to perform the fetch with.
+     
+     - returns: A typed array containing the results. If executeFetchRequest throws an error, an empty array is returned.
+     */
+    public  func fetchObjects<T: NSManagedObject>(entity: T.Type, predicate: NSPredicate? = nil, sortDescriptors: [NSSortDescriptor]? = nil, context: NSManagedObjectContext) -> [T] {
+        
+        let request = NSFetchRequest<T>(entityName: String(describing: entity))
+        request.predicate = predicate
+        request.sortDescriptors = sortDescriptors
+        request.fetchBatchSize = defaultFetchBatchSize
+        
+        do {
+            return try context.fetch(request)
+        }
+        catch let error as NSError {
+            log(error: error)
+            return [T]()
+        }
+    }
+    
+    /**
+     This is a convenience method for performing a fetch request that fetches a single object. Note: Errors thrown by executeFetchRequest are suppressed and logged in order to make usage less verbose. If detecting thrown errors is needed in your use case, you will need to use Core Data directly.
+     
+     - parameter entity:          The NSManagedObject subclass to be fetched.
+     - parameter predicate:       A predicate to use for the fetch if needed (defaults to nil).
+     - parameter sortDescriptors: Sort descriptors to use for the fetch if needed (defaults to nil).
+     - parameter context:         The NSManagedObjectContext to perform the fetch with.
+     
+     - returns: A typed result if found. If executeFetchRequest throws an error, nil is returned.
+     */
+    public  func fetchObject<T: NSManagedObject>(entity: T.Type, predicate: NSPredicate? = nil, sortDescriptors: [NSSortDescriptor]? = nil, context: NSManagedObjectContext) -> T? {
+        
+        let request = NSFetchRequest<T>(entityName: String(describing: entity))
+        
+        request.predicate = predicate
+        request.sortDescriptors = sortDescriptors
+        request.fetchLimit = 1
+        
+        do {
+            return try context.fetch(request).first
+        }
+        catch let error as NSError {
+            log(error: error)
+            return nil
+        }
+    }
+    
+    // MARK: Deleting
+    
+    /**
+     Iterates over the objects and deletes them using the supplied context.
+     
+     - parameter objects: The objects to delete.
+     - parameter context: The context to perform the deletion with.
+     */
+    public  func delete(_ objects: [NSManagedObject]) {
+        
+        self.privateContext.perform {
+            for object in objects {
+                self.privateContext.delete(object)
+            }
+        }
+    }
+    
+    /**
+     For each entity in the model, fetches all objects into memory, iterates over each object and deletes them using the main context. Note: Errors thrown by executeFetchRequest are suppressed and logged in order to make usage less verbose. If detecting thrown errors is needed in your use case, you will need to use Core Data directly.
+     */
+    public  func deleteAllObjects() {
+        
+        self.privateContext.perform {
             
-            context.performBlockAndWait{
+            for entityName in self.managedObjectModel.entitiesByName.keys {
                 
-                var saveError:NSError?
-                let saved = context.save(&saveError)
+                let request = NSFetchRequest<NSManagedObject>(entityName: entityName)
+                request.includesPropertyValues = false
                 
-                if !saved {
-                    if let error = saveError{
-                        println("Warning!! Saving error \(error.description)")
+                do {
+                    for object in try self.privateContext.fetch(request) {
+                        self.privateContext.delete(object)
                     }
                 }
-                
-                if context.parentContext != nil {
-                    
-                    context.parentContext.performBlockAndWait{
-                        var saveError:NSError?
-                        let saved = context.parentContext.save(&saveError)
-                        
-                        if !saved{
-                            if let error = saveError{
-                                println("Warning!! Saving parent error \(error.description)")
-                            }
-                        }
-                    }
+                catch let error as NSError {
+                    self.log(error: error)
                 }
             }
         }
     }
     
+    // MARK: Saving
     
-    
-    
-    
-    func contextWillSave(notification:NSNotification){
+    /**
+     Saves changes to the persistent store.
+     
+     - parameter synchronously: Whether the main thread should block while writing to the persistent store or not.
+     - parameter completion:    Called after the save on the private context completes. If there is an error, it is called immediately and the error parameter is populated.
+     */
+    public  func saveChanges(completion: ((Error?) -> Void)? = nil) {
         
-        let context : NSManagedObjectContext! = notification.object as NSManagedObjectContext
-        var insertedObjects : NSSet = context.insertedObjects
-        
-        if insertedObjects.count != 0 {
-            var obtainError:NSError?
-
-            context.obtainPermanentIDsForObjects(insertedObjects.allObjects, error: &obtainError)
-            if let error = obtainError {
-                println("Warning!! obtaining ids error \(error.description)")
+        if self.privateContext.hasChanges {
+            
+            self.privateContext.perform {
+                do {
+                    try self.privateContext.save()
+                    completion?(nil)
+                }
+                catch let error {
+                    completion?(error)
+                }
             }
+        }else{
+            //CoreDataManager.log no changes found in context
         }
+    }
+    
+    // MARK: Logging
+    
+    private func log(error: Error, file: StaticString = #file, function: StaticString = #function, line: UInt = #line) {
         
+        //errorLogger?.log(error: error, file: file, function: function, line: line)
     }
-    
-    
-    // #pragma mark - Utilities
-
-
-    func deleteEntity(object:NSManagedObject)-> () {
-        object.managedObjectContext .deleteObject(object)
-    }
-
-
-
-    // #pragma mark - Application's Documents directory
-
-    // Returns the URL to the application's Documents directory.
-    var applicationDocumentsDirectory: NSURL {
-    let urls = NSFileManager.defaultManager().URLsForDirectory(.DocumentDirectory, inDomains: .UserDomainMask)
-        return urls[urls.endIndex-1] as NSURL
-    }
-    
-    
-    func databaseOptions() -> Dictionary <String,Bool> {
-        var options =  Dictionary<String,Bool>()
-        options[NSMigratePersistentStoresAutomaticallyOption] = true
-        options[NSInferMappingModelAutomaticallyOption] = true
-        return options
-    }
-  
-
-    
 }
-
