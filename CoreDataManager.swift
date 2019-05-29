@@ -282,4 +282,37 @@ class CoreDataManager:NSObject {
         
         //errorLogger?.log(error: error, file: file, function: function, line: line)
     }
+ 
+    public func resetDatabase() {
+        
+        writerContext.performAndWait {
+            
+            let persistentStores = self.persistentStoreCoordinator.persistentStores
+
+            persistentStores.forEach { (store) in
+
+                do{
+                    try self.persistentStoreCoordinator.remove(store)
+
+                    if let path = store.url?.path{
+                        try FileManager.default.removeItem(atPath: path)
+                    }
+
+                }catch let error{
+                    print(error)
+                }
+            }
+            
+            _writerContext = nil
+            _mainContext = nil
+            _privateContext = nil
+            _managedObjectModel = nil
+            _persistentStoreCoordinator = nil
+            
+            NotificationCenter.default.removeObserver(self)
+            
+            // again add the observers
+            addObservers()
+        }
+    }
 }
